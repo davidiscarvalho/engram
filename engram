@@ -1,0 +1,615 @@
+#!/usr/bin/env python3
+"""
+engram — Persistent memory CLI for Claude Code
+~/.claude/engram/engram
+
+SQLite + FTS5 knowledge base with cross-machine git sync.
+
+Usage:
+  engram search "query"                  # search all notes (~50 tokens)
+  engram search -p . "query"             # search current project
+  engram get <id>                        # fetch full note
+  engram add "Title" "tags" "body"       # add global note
+  engram add -p . "Title" "tags" "body"  # add project note
+  engram list                            # recent notes
+  engram list -p .                       # project notes
+  engram tags                            # all tags + counts
+  engram topics                          # topic hub notes
+  engram stats                           # db stats + sync info
+  engram session start                   # begin session log
+  engram session end                     # archive session
+  engram session recent                  # show recent sessions
+  engram ingest <file>                   # curation protocol for a file
+  engram archive <id>                    # soft-delete note
+  engram export                          # dump to JSON (stdout)
+  engram import <file>                   # restore from JSON
+
+  engram remote add <url>                # configure git sync remote
+  engram remote show                     # show current remote
+  engram push                            # export → commit → push
+  engram pull                            # pull → merge new notes
+  engram sync                            # pull then push (full sync)
+"""
+
+import sys
+import os
+import json
+import sqlite3
+import datetime
+import argparse
+import subprocess
+from pathlib import Path
+
+ENGRAM_DIR   = Path.home() / ".claude" / "engram"
+DB_PATH      = ENGRAM_DIR / "memory.db"
+SESSION_PATH = ENGRAM_DIR / ".current_session.json"
+CONFIG_PATH  = ENGRAM_DIR / "config.json"
+SYNC_DIR     = ENGRAM_DIR / "sync"
+SYNC_FILE    = SYNC_DIR / "memory.json"
+
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
+
+def load_config() -> dict:
+    if CONFIG_PATH.exists():
+        return json.loads(CONFIG_PATH.read_text())
+    return {}
+
+def save_config(cfg: dict):
+    ENGRAM_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+
+def machine_name() -> str:
+    return load_config().get("machine", os.uname().nodename)
+
+# ─── DB ───────────────────────────────────────────────────────────────────────
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS notes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    uuid        TEXT    UNIQUE,
+    type        TEXT    NOT NULL DEFAULT 'note',
+    project     TEXT    DEFAULT NULL,
+    title       TEXT    NOT NULL,
+    tags        TEXT    NOT NULL DEFAULT '',
+    content     TEXT    NOT NULL,
+    summary     TEXT    NOT NULL DEFAULT '',
+    machine     TEXT    DEFAULT NULL,
+    created_at  TEXT    DEFAULT (datetime('now')),
+    updated_at  TEXT    DEFAULT (datetime('now')),
+    archived_at TEXT    DEFAULT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notes_project ON notes(project);
+CREATE INDEX IF NOT EXISTS idx_notes_type    ON notes(type);
+CREATE INDEX IF NOT EXISTS idx_notes_tags    ON notes(tags);
+CREATE INDEX IF NOT EXISTS idx_notes_uuid    ON notes(uuid);
+CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+    title, tags, content, summary, project,
+    content='notes', content_rowid='id'
+);
+CREATE TRIGGER IF NOT EXISTS notes_ai AFTER INSERT ON notes BEGIN
+    INSERT INTO notes_fts(rowid, title, tags, content, summary, project)
+    VALUES (new.id, new.title, new.tags, new.content, new.summary, new.project);
+END;
+CREATE TRIGGER IF NOT EXISTS notes_ad AFTER DELETE ON notes BEGIN
+    INSERT INTO notes_fts(notes_fts, rowid, title, tags, content, summary, project)
+    VALUES ('delete', old.id, old.title, old.tags, old.content, old.summary, old.project);
+END;
+CREATE TRIGGER IF NOT EXISTS notes_au AFTER UPDATE ON notes BEGIN
+    INSERT INTO notes_fts(notes_fts, rowid, title, tags, content, summary, project)
+    VALUES ('delete', old.id, old.title, old.tags, old.content, old.summary, old.project);
+    INSERT INTO notes_fts(rowid, title, tags, content, summary, project)
+    VALUES (new.id, new.title, new.tags, new.content, new.summary, new.project);
+END;
+"""
+
+def get_db():
+    ENGRAM_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    # Migrate first — add new columns before running SCHEMA (which may reference them)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS notes (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            type        TEXT    NOT NULL DEFAULT 'note',
+            project     TEXT    DEFAULT NULL,
+            title       TEXT    NOT NULL,
+            tags        TEXT    NOT NULL DEFAULT '',
+            content     TEXT    NOT NULL,
+            summary     TEXT    NOT NULL DEFAULT '',
+            created_at  TEXT    DEFAULT (datetime('now')),
+            updated_at  TEXT    DEFAULT (datetime('now')),
+            archived_at TEXT    DEFAULT NULL
+        )
+    """)
+    conn.commit()
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(notes)").fetchall()]
+    if 'uuid' not in cols:
+        conn.execute("ALTER TABLE notes ADD COLUMN uuid TEXT")
+        conn.commit()
+    if 'machine' not in cols:
+        conn.execute("ALTER TABLE notes ADD COLUMN machine TEXT")
+        conn.commit()
+    # Now run full schema (indexes, FTS, triggers)
+    conn.executescript(SCHEMA)
+    conn.commit()
+    return conn
+
+def make_uuid() -> str:
+    import hashlib, time, random
+    raw = f"{time.time()}{random.random()}{machine_name()}"
+    return hashlib.sha1(raw.encode()).hexdigest()[:16]
+
+def ensure_uuids(db):
+    rows = db.execute("SELECT id FROM notes WHERE uuid IS NULL").fetchall()
+    for r in rows:
+        db.execute("UPDATE notes SET uuid=? WHERE id=?", [make_uuid(), r['id']])
+    if rows:
+        db.commit()
+
+def make_summary(content: str, length=180) -> str:
+    text = " ".join(content.split())
+    return text[:length] + ("…" if len(text) > length else "")
+
+def fmt_date(dt_str: str) -> str:
+    try:
+        return datetime.datetime.fromisoformat(dt_str).strftime("%Y-%m-%d")
+    except Exception:
+        return dt_str or ""
+
+# ─── CORE COMMANDS ────────────────────────────────────────────────────────────
+
+def cmd_search(args):
+    project = resolve_project(args)
+    db = get_db()
+    where_extra = "AND n.archived_at IS NULL AND n.type != 'session'"
+    params = [args.query]
+    if project:
+        where_extra += " AND (n.project = ? OR n.project IS NULL)"
+        params.append(project)
+    sql = f"""
+        SELECT n.id, n.type, n.project, n.title, n.tags, n.summary, n.machine
+        FROM notes_fts f JOIN notes n ON f.rowid = n.id
+        WHERE notes_fts MATCH ? {where_extra}
+        ORDER BY rank LIMIT 10
+    """
+    rows = db.execute(sql, params).fetchall()
+    if not rows:
+        print("No results.")
+        return
+    for r in rows:
+        proj  = f"[{r['project']}] " if r['project'] else ""
+        tags  = f"  #{r['tags']}" if r['tags'] else ""
+        badge = f"({r['type']}) " if r['type'] != 'note' else ""
+        mach  = f" @{r['machine']}" if r['machine'] and r['machine'] != machine_name() else ""
+        print(f"[{r['id']:04d}] {badge}{proj}{r['title']}{tags}{mach}")
+        if r['summary']:
+            print(f"       {r['summary'][:120]}")
+        print()
+
+def cmd_get(args):
+    db = get_db()
+    row = db.execute("SELECT * FROM notes WHERE id = ?", [args.id]).fetchone()
+    if not row:
+        print(f"Note {args.id} not found.")
+        return
+    proj = f"  project: {row['project']}" if row['project'] else ""
+    mach = f"  machine: {row['machine']}" if row['machine'] else ""
+    print(f"─── [{row['id']:04d}] {row['title']} ───")
+    print(f"  type: {row['type']}  tags: {row['tags']}{proj}{mach}")
+    print(f"  created: {fmt_date(row['created_at'])}  updated: {fmt_date(row['updated_at'])}")
+    if row['archived_at']:
+        print(f"  ⚠ ARCHIVED: {fmt_date(row['archived_at'])}")
+    print()
+    print(row['content'])
+    print()
+
+def cmd_add(args):
+    project = resolve_project(args)
+    content = args.body
+    db = get_db()
+    cursor = db.execute(
+        "INSERT INTO notes (uuid, type, project, title, tags, content, summary, machine) VALUES (?,?,?,?,?,?,?,?)",
+        [make_uuid(), 'note', project, args.title, args.tags, content, make_summary(content), machine_name()]
+    )
+    db.commit()
+    scope = f"[{project}]" if project else "[global]"
+    print(f"✓ Added note {cursor.lastrowid:04d} {scope}: {args.title}")
+
+def cmd_list(args):
+    project = resolve_project(args)
+    db = get_db()
+    limit = getattr(args, 'limit', 15)
+    where = "WHERE archived_at IS NULL AND type = 'note'"
+    params = []
+    if project:
+        where += " AND project = ?"
+        params.append(project)
+    rows = db.execute(
+        f"SELECT id, project, title, tags, summary, created_at FROM notes {where} ORDER BY id DESC LIMIT ?",
+        params + [limit]
+    ).fetchall()
+    if not rows:
+        print("No notes found.")
+        return
+    for r in rows:
+        proj = f"[{r['project']}] " if r['project'] else ""
+        tags = f"  #{r['tags']}" if r['tags'] else ""
+        print(f"[{r['id']:04d}] {proj}{r['title']}{tags}  ({fmt_date(r['created_at'])})")
+        if r['summary']:
+            print(f"       {r['summary'][:100]}")
+    print(f"\n{len(rows)} notes shown.")
+
+def cmd_tags(args):
+    db = get_db()
+    rows = db.execute("SELECT tags FROM notes WHERE archived_at IS NULL AND tags != ''").fetchall()
+    counts = {}
+    for r in rows:
+        for tag in r['tags'].split(','):
+            tag = tag.strip()
+            if tag:
+                counts[tag] = counts.get(tag, 0) + 1
+    if not counts:
+        print("No tags found.")
+        return
+    for tag, count in sorted(counts.items(), key=lambda x: -x[1]):
+        print(f"  {tag:<30} {count}")
+
+def cmd_topics(args):
+    db = get_db()
+    rows = db.execute(
+        "SELECT id, title, summary FROM notes WHERE type='topic' AND archived_at IS NULL ORDER BY title"
+    ).fetchall()
+    if not rows:
+        print("No topic notes yet. Topics auto-suggest when a concept appears in 3+ notes.")
+        return
+    print("── Topic Hubs ──")
+    for r in rows:
+        print(f"[{r['id']:04d}] {r['title']}")
+        if r['summary']:
+            print(f"       {r['summary'][:100]}")
+    print()
+
+def cmd_stats(args):
+    db = get_db()
+    total    = db.execute("SELECT COUNT(*) FROM notes WHERE archived_at IS NULL").fetchone()[0]
+    sessions = db.execute("SELECT COUNT(*) FROM notes WHERE type='session' AND archived_at IS NULL").fetchone()[0]
+    topics   = db.execute("SELECT COUNT(*) FROM notes WHERE type='topic'   AND archived_at IS NULL").fetchone()[0]
+    archived = db.execute("SELECT COUNT(*) FROM notes WHERE archived_at IS NOT NULL").fetchone()[0]
+    projects = db.execute("SELECT COUNT(DISTINCT project) FROM notes WHERE project IS NOT NULL AND archived_at IS NULL").fetchone()[0]
+    size_kb  = DB_PATH.stat().st_size // 1024 if DB_PATH.exists() else 0
+    cfg      = load_config()
+    print(f"── engram stats ────────────────────")
+    print(f"  Machine:          {cfg.get('machine', os.uname().nodename)}")
+    print(f"  Notes (active):   {total - sessions - topics}")
+    print(f"  Session logs:     {sessions}")
+    print(f"  Topic hubs:       {topics}")
+    print(f"  Archived:         {archived}")
+    print(f"  Projects tracked: {projects}")
+    print(f"  DB size:          {size_kb} KB")
+    print(f"  DB path:          {DB_PATH}")
+    print(f"  Sync remote:      {cfg.get('remote', 'not configured')}")
+
+def cmd_archive(args):
+    db = get_db()
+    db.execute("UPDATE notes SET archived_at=datetime('now') WHERE id=?", [args.id])
+    db.commit()
+    print(f"✓ Note {args.id} archived.")
+
+def cmd_export(args):
+    db = get_db()
+    ensure_uuids(db)
+    rows = db.execute("SELECT * FROM notes").fetchall()
+    print(json.dumps([dict(r) for r in rows], indent=2))
+
+def cmd_import(args):
+    with open(args.file) as f:
+        data = json.load(f)
+    db = get_db()
+    count = 0
+    for r in data:
+        r.pop('id', None)
+        cols = ', '.join(r.keys())
+        placeholders = ', '.join(['?'] * len(r))
+        db.execute(f"INSERT INTO notes ({cols}) VALUES ({placeholders})", list(r.values()))
+        count += 1
+    db.commit()
+    print(f"✓ Imported {count} notes.")
+
+def cmd_ingest(args):
+    print(f"""
+── engram ingest: Curation Protocol ───────────────────────────────────────
+
+File to analyse: {args.file}
+
+Instructions for Claude Code:
+1. Read the file carefully
+2. Extract ONLY non-obvious, high-value insights — not obvious docs content
+3. For each insight, call:
+   engram add "Concise title" "tag1,tag2" "Atomic content — context, insight, gotcha"
+4. Use -p <project_name> if this knowledge is project-specific
+5. Skip anything easily found in official docs or that you already know
+6. Aim for 5–15 notes max per document — quality over quantity
+
+Quality checklist:
+  ✓ Actionable — tells you WHAT TO DO, not just what exists
+  ✓ Contextual — explains WHEN this applies
+  ✓ Non-obvious — captures what docs don't make clear
+  ✓ Distilled — your words, not copy-paste
+
+Begin analysis of: {args.file}
+""")
+
+# ─── SESSION COMMANDS ─────────────────────────────────────────────────────────
+
+def cmd_session_start(args):
+    project = resolve_project(args)
+    cwd = os.getcwd()
+    now = datetime.datetime.now().isoformat()
+    session = {"started_at": now, "project": project or Path(cwd).name, "cwd": cwd}
+    SESSION_PATH.write_text(json.dumps(session, indent=2))
+    print(f"✓ Session started at {now[:16].replace('T',' ')}")
+    print(f"  Project: {session['project']}  |  Machine: {machine_name()}")
+    db = get_db()
+    recent = db.execute(
+        "SELECT id, title, summary, created_at, machine FROM notes WHERE type='session' AND archived_at IS NULL ORDER BY id DESC LIMIT 5"
+    ).fetchall()
+    if recent:
+        print("\n── Recent sessions (memory context) ────────────────────")
+        for r in recent:
+            mach = f" @{r['machine']}" if r['machine'] else ""
+            print(f"  [{r['id']:04d}] {fmt_date(r['created_at'])}{mach}  {r['title']}")
+            if r['summary']:
+                print(f"         {r['summary'][:100]}")
+        print()
+
+def cmd_session_end(args):
+    if not SESSION_PATH.exists():
+        print("No active session. Run: engram session start")
+        return
+    session = json.loads(SESSION_PATH.read_text())
+    project = session.get('project')
+    started = session.get('started_at', '')[:16].replace('T', ' ')
+    ended   = datetime.datetime.now().isoformat()[:16].replace('T', ' ')
+    content = f"""## Session: {started} → {ended}
+Project: {project}
+Machine: {machine_name()}
+Dir: {session.get('cwd', '')}
+
+### What Was Done
+[Claude: fill in what was accomplished this session]
+
+### Decisions Made
+[Claude: fill in key decisions and rationale]
+
+### Files Changed
+[Claude: list key files modified]
+
+### Next Steps
+[Claude: fill in what to pick up next time]
+
+### Context Notes
+[Claude: anything future-you needs to know before starting next session]
+"""
+    title = f"Session: {project} ({started[:10]})"
+    db = get_db()
+    cursor = db.execute(
+        "INSERT INTO notes (uuid, type, project, title, tags, content, summary, machine) VALUES (?,?,?,?,?,?,?,?)",
+        [make_uuid(), 'session', project, title, f'session,{project}', content, make_summary(content), machine_name()]
+    )
+    db.commit()
+    SESSION_PATH.unlink(missing_ok=True)
+    print(f"✓ Session logged as note {cursor.lastrowid:04d}")
+    print(f"  View it: engram get {cursor.lastrowid}")
+    print("── Ask Claude to fill in the sections above.")
+
+def cmd_session_recent(args):
+    db = get_db()
+    limit = getattr(args, 'limit', 10)
+    rows = db.execute(
+        "SELECT id, project, title, summary, created_at, machine FROM notes WHERE type='session' AND archived_at IS NULL ORDER BY id DESC LIMIT ?",
+        [limit]
+    ).fetchall()
+    if not rows:
+        print("No session logs yet.")
+        return
+    print("── Recent Sessions ──────────────────────────────────────")
+    for r in rows:
+        mach = f" @{r['machine']}" if r['machine'] else ""
+        print(f"[{r['id']:04d}] {fmt_date(r['created_at'])}{mach}  [{r['project'] or 'global'}]  {r['title']}")
+        if r['summary']:
+            print(f"       {r['summary'][:110]}")
+    print()
+
+# ─── SYNC COMMANDS ────────────────────────────────────────────────────────────
+
+def git(*cmd, cwd=None):
+    result = subprocess.run(
+        ["git"] + list(cmd),
+        cwd=str(cwd or SYNC_DIR),
+        capture_output=True, text=True
+    )
+    return result.stdout.strip(), result.returncode
+
+def require_remote():
+    remote = load_config().get("remote")
+    if not remote:
+        print("✗ No sync remote configured.")
+        print("  Run: engram remote add git@github.com:davidiscarvalho/engram-memory.git")
+        sys.exit(1)
+    return remote
+
+def ensure_sync_clone(remote: str):
+    if not SYNC_DIR.exists():
+        print(f"  Cloning {remote}...")
+        result = subprocess.run(
+            ["git", "clone", remote, str(SYNC_DIR)],
+            capture_output=True, text=True
+        )
+        if result.returncode != 0:
+            print(f"✗ Clone failed:\n{result.stderr}")
+            print("  Check your SSH key is added to GitHub (ssh -T git@github.com)")
+            sys.exit(1)
+        print(f"  ✓ Cloned to {SYNC_DIR}")
+
+def cmd_remote_add(args):
+    cfg = load_config()
+    cfg["remote"] = args.url
+    if not cfg.get("machine"):
+        cfg["machine"] = os.uname().nodename
+    save_config(cfg)
+    print(f"✓ Remote set: {args.url}")
+    print(f"  Machine name: {cfg['machine']}")
+    print(f"\n  Next: engram push")
+
+def cmd_remote_show(args):
+    cfg = load_config()
+    print(f"  Remote:  {cfg.get('remote', 'not configured')}")
+    print(f"  Machine: {cfg.get('machine', os.uname().nodename)}")
+
+def cmd_push(args):
+    remote = require_remote()
+    ensure_sync_clone(remote)
+    db = get_db()
+    ensure_uuids(db)
+
+    print("── engram push ──────────────────────────────────────────")
+    print("  Pulling latest first...")
+    git("pull", "--rebase")
+
+    rows = db.execute("SELECT * FROM notes").fetchall()
+    data = [dict(r) for r in rows]
+    SYNC_FILE.write_text(json.dumps(data, indent=2))
+    print(f"  Exported {len(data)} notes → memory.json")
+
+    git("add", "memory.json")
+    _, rc = git("diff", "--cached", "--quiet")
+    if rc == 0:
+        print("  Nothing new to push.")
+        return
+
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    msg = f"sync: {machine_name()} @ {now} ({len(data)} notes)"
+    git("commit", "-m", msg)
+    _, rc = git("push")
+    if rc != 0:
+        git("push", "--set-upstream", "origin", "main")
+    print(f"  ✓ Pushed: {msg}")
+
+def cmd_pull(args):
+    remote = require_remote()
+    ensure_sync_clone(remote)
+
+    print("── engram pull ──────────────────────────────────────────")
+    print("  Pulling from remote...")
+    _, rc = git("pull", "--rebase")
+    if rc != 0:
+        print("✗ Pull failed. Check your connection and SSH key.")
+        sys.exit(1)
+
+    if not SYNC_FILE.exists():
+        print("  No memory.json in remote yet. Push from another machine first.")
+        return
+
+    remote_data = json.loads(SYNC_FILE.read_text())
+    db = get_db()
+    ensure_uuids(db)
+
+    local_uuids = {
+        r[0] for r in db.execute("SELECT uuid FROM notes WHERE uuid IS NOT NULL").fetchall()
+    }
+
+    new_count = 0
+    for r in remote_data:
+        uid = r.get("uuid")
+        if not uid or uid in local_uuids:
+            continue
+        r.pop("id", None)
+        cols = ", ".join(r.keys())
+        placeholders = ", ".join(["?"] * len(r))
+        try:
+            db.execute(f"INSERT INTO notes ({cols}) VALUES ({placeholders})", list(r.values()))
+            new_count += 1
+        except sqlite3.IntegrityError:
+            pass
+    db.commit()
+
+    if new_count:
+        print(f"  ✓ Merged {new_count} new notes from remote.")
+    else:
+        print(f"  Already up to date. ({len(remote_data)} notes in remote)")
+
+def cmd_sync(args):
+    cmd_pull(args)
+    print()
+    cmd_push(args)
+
+# ─── HELPERS ──────────────────────────────────────────────────────────────────
+
+def resolve_project(args):
+    if hasattr(args, 'project'):
+        if args.project == '.':
+            return Path(os.getcwd()).name
+        return args.project
+    return None
+
+# ─── CLI PARSER ───────────────────────────────────────────────────────────────
+
+def build_parser():
+    p = argparse.ArgumentParser(prog='engram', description='engram — persistent memory for Claude Code')
+    sub = p.add_subparsers(dest='cmd')
+
+    ps = sub.add_parser('search'); ps.add_argument('-p','--project',default=None,metavar='PROJECT'); ps.add_argument('query')
+    pg = sub.add_parser('get');    pg.add_argument('id', type=int)
+    pa = sub.add_parser('add');    pa.add_argument('-p','--project',default=None,metavar='PROJECT'); pa.add_argument('title'); pa.add_argument('tags'); pa.add_argument('body')
+    pl = sub.add_parser('list');   pl.add_argument('-p','--project',default=None,metavar='PROJECT'); pl.add_argument('--limit',type=int,default=15)
+
+    sub.add_parser('tags'); sub.add_parser('topics'); sub.add_parser('stats')
+
+    par = sub.add_parser('archive'); par.add_argument('id', type=int)
+    sub.add_parser('export')
+    pi = sub.add_parser('import'); pi.add_argument('file')
+    pin = sub.add_parser('ingest'); pin.add_argument('file')
+
+    psess = sub.add_parser('session')
+    psess_sub = psess.add_subparsers(dest='session_cmd')
+    pss = psess_sub.add_parser('start'); pss.add_argument('-p','--project',default=None,metavar='PROJECT'); pss.add_argument('--goal',default=None)
+    pse = psess_sub.add_parser('end');   pse.add_argument('--summary',default=None); pse.add_argument('--decisions',default=None); pse.add_argument('--next-steps',default=None)
+    psr = psess_sub.add_parser('recent'); psr.add_argument('--limit',type=int,default=10)
+
+    premote = sub.add_parser('remote')
+    premote_sub = premote.add_subparsers(dest='remote_cmd')
+    pra = premote_sub.add_parser('add'); pra.add_argument('url')
+    premote_sub.add_parser('show')
+
+    sub.add_parser('push')
+    sub.add_parser('pull')
+    sub.add_parser('sync')
+
+    return p
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    dispatch = {
+        'search': cmd_search, 'get': cmd_get, 'add': cmd_add, 'list': cmd_list,
+        'tags': cmd_tags, 'topics': cmd_topics, 'stats': cmd_stats,
+        'archive': cmd_archive, 'export': cmd_export, 'import': cmd_import,
+        'ingest': cmd_ingest, 'push': cmd_push, 'pull': cmd_pull, 'sync': cmd_sync,
+    }
+
+    if args.cmd == 'session':
+        {'start': cmd_session_start, 'end': cmd_session_end, 'recent': cmd_session_recent}.get(
+            args.session_cmd, lambda _: print("Usage: engram session [start|end|recent]")
+        )(args)
+    elif args.cmd == 'remote':
+        {'add': cmd_remote_add, 'show': cmd_remote_show}.get(
+            args.remote_cmd, lambda _: print("Usage: engram remote [add <url>|show]")
+        )(args)
+    elif args.cmd in dispatch:
+        dispatch[args.cmd](args)
+    else:
+        parser.print_help()
+
+if __name__ == '__main__':
+    main()

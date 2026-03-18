@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Never commit personal data
+memory.db
+*.db
+config.json
+.current_session.json
+.session_context.txt
+.compaction_reminder.txt
+sync/
