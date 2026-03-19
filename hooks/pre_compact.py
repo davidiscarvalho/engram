@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
 hooks/pre_compact.py
-Claude Code PreCompact hook — fires when context window is nearly full.
-Reminds Claude to save important decisions to engram before context compresses.
+Claude Code PreCompact hook — fires when /compact is called.
+Injects a reminder into Claude's context to save decisions to engram
+before compaction erases early session knowledge.
 """
 
 import sys
 import json
 from pathlib import Path
+
 
 def main():
     try:
@@ -15,29 +17,24 @@ def main():
     except Exception:
         pass
 
-    reminder = """
-── engram: Context Compaction Warning ────────────────────────────────────
+    reminder = (
+        "── engram: Save before compaction ──────────────────────────────────────\n"
+        "Context is about to compact. Save any knowledge not yet in engram:\n\n"
+        "  engram add -p . \"Decision: <topic>\" \"decision,<tag>\" \"<what and why>\"\n"
+        "  engram add -p . \"Impl: <feature>\" \"impl,<tag>\" \"<what was built>\"\n"
+        "  engram add -p . \"Fix: <bug>\" \"bug,fix\" \"<root cause and solution>\"\n\n"
+        "Fill in the current session log if it has empty sections:\n"
+        "  engram session recent   → get the session note ID\n"
+        "  engram update <id> \"<full content>\"\n"
+        "─────────────────────────────────────────────────────────────────────────"
+    )
 
-Context window is filling up. Save knowledge NOW — before compaction:
-
-1. Key decisions (most important):
-   engram add -p . "Decision: <topic>" "decision,<tags>" "<what was decided and why>"
-
-2. Important discoveries:
-   engram add -p . "Insight: <topic>" "insight,<tags>" "<what you learned>"
-
-3. Completed work summary:
-   engram add -p . "Impl: <feature>" "impl,<tags>" "<what was built, key choices>"
-
-4. Fill in the current session log if it has empty sections:
-   engram session recent   → get the session note ID
-   engram update <id> "<full content replacing the [Claude: fill in...] placeholders>"
-
-──────────────────────────────────────────────────────────────────────────
-"""
-
-    reminder_file = Path.home() / ".claude" / "engram" / ".compaction_reminder.txt"
-    reminder_file.write_text(reminder)
+    print(json.dumps({
+        "hookSpecificOutput": {
+            "hookEventName": "PreCompact",
+            "additionalContext": reminder
+        }
+    }))
     sys.exit(0)
 
 
