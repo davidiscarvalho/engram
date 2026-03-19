@@ -10,6 +10,7 @@ import os
 import json
 import sqlite3
 import datetime
+import subprocess as _sp
 from pathlib import Path
 
 DB_PATH      = Path.home() / ".claude" / "engram" / "memory.db"
@@ -59,13 +60,38 @@ def main():
         context_file = Path.home() / ".claude" / "engram" / ".session_context.txt"
         context_file.write_text("\n".join(lines))
 
-        if not SESSION_PATH.exists():
-            session = {
+        def _session_is_alive(session_data: dict) -> bool:
+            pid = session_data.get("pid")
+            if not pid:
+                return False  # old format without PID → treat as stale
+            try:
+                os.kill(int(pid), 0)
+                return True   # process alive
+            except ProcessLookupError:
+                return False  # process dead → stale
+            except PermissionError:
+                return True   # process alive, different owner (safe default)
+
+        def _new_session():
+            SESSION_PATH.write_text(json.dumps({
                 "started_at": datetime.datetime.now().isoformat(),
                 "project": cwd_project,
-                "cwd": os.getcwd()
-            }
-            SESSION_PATH.write_text(json.dumps(session, indent=2))
+                "cwd": os.getcwd(),
+                "pid": os.getpid()
+            }, indent=2))
+
+        if not SESSION_PATH.exists():
+            _new_session()
+        else:
+            existing = json.loads(SESSION_PATH.read_text())
+            if not _session_is_alive(existing):
+                # Stale session (crash/kill) → end it, then start fresh
+                engram_cli = Path.home() / ".claude" / "engram" / "engram"
+                if engram_cli.exists():
+                    _sp.run(["python3", str(engram_cli), "session", "end"],
+                            capture_output=True)
+                _new_session()
+            # else: same process, session continues — do nothing
 
     except Exception:
         pass

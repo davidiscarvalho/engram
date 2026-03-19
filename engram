@@ -345,7 +345,7 @@ def cmd_session_start(args):
     project = resolve_project(args)
     cwd = os.getcwd()
     now = datetime.datetime.now().isoformat()
-    session = {"started_at": now, "project": project or Path(cwd).name, "cwd": cwd}
+    session = {"started_at": now, "project": project or Path(cwd).name, "cwd": cwd, "pid": os.getpid()}
     SESSION_PATH.write_text(json.dumps(session, indent=2))
     print(f"✓ Session started at {now[:16].replace('T',' ')}")
     print(f"  Project: {session['project']}  |  Machine: {machine_name()}")
@@ -367,28 +367,46 @@ def cmd_session_end(args):
         print("No active session. Run: engram session start")
         return
     session = json.loads(SESSION_PATH.read_text())
+
+    started_str = session.get('started_at', '')
+    started_dt  = datetime.datetime.fromisoformat(started_str)
+    ended_dt    = datetime.datetime.now()
+    duration_m  = (ended_dt - started_dt).total_seconds() / 60
+
+    # Skip trivial sessions
+    if duration_m < 5:
+        SESSION_PATH.unlink(missing_ok=True)
+        print(f"Session too short ({duration_m:.1f}min), not logged.")
+        return
+
     project = session.get('project')
-    started = session.get('started_at', '')[:16].replace('T', ' ')
-    ended   = datetime.datetime.now().isoformat()[:16].replace('T', ' ')
+    started = started_str[:16].replace('T', ' ')
+    ended   = ended_dt.isoformat()[:16].replace('T', ' ')
+
+    what_done  = getattr(args, 'summary',    None) or "[Claude: fill in what was accomplished]"
+    decisions  = getattr(args, 'decisions',  None) or "[Claude: fill in key decisions and rationale]"
+    next_steps = getattr(args, 'next_steps', None) or "[Claude: fill in what to pick up next time]"
+
     content = f"""## Session: {started} → {ended}
 Project: {project}
 Machine: {machine_name()}
 Dir: {session.get('cwd', '')}
+Duration: {duration_m:.0f}min
 
 ### What Was Done
-[Claude: fill in what was accomplished this session]
+{what_done}
 
 ### Decisions Made
-[Claude: fill in key decisions and rationale]
+{decisions}
 
 ### Files Changed
 [Claude: list key files modified]
 
 ### Next Steps
-[Claude: fill in what to pick up next time]
+{next_steps}
 
 ### Context Notes
-[Claude: anything future-you needs to know before starting next session]
+[Claude: anything future-you needs to know]
 """
     title = f"Session: {project} ({started[:10]})"
     db = get_db()
