@@ -13,7 +13,7 @@ Claude Code forgets everything when a session ends. Every time you start fresh, 
 - **Remembers your decisions** — architecture choices, bug fixes, patterns you've settled on
 - **Logs every session** — what you built, what you decided, what to pick up next time
 - **Searches in ~50 tokens** — SQLite full-text search, flat cost at any scale
-- **Hooks into Claude Code** — auto-loads context at the start of every session
+- **Hooks into Claude Code** — auto-loads context, auto-saves compaction summaries, auto-closes sessions
 - **Syncs across machines** — Mac, home server, wherever you work, via a private git repo
 - **Stays isolated on prod** — your Hetzner server gets its own local memory, never connected to the shared repo
 
@@ -55,12 +55,15 @@ Full details → [INSTALL.md#sync-setup](./INSTALL.md#sync-setup)
 
 ## The daily loop
 
+Sessions start and end **automatically** via hooks — no manual calls needed.
+
 ```bash
-engram session start -p .       # orient Claude with recent context
-engram add -p . "Decision: ..." "tags" "content"   # save as you go
-engram session end               # archive the session
-engram sync                      # push to other machines
+engram add -p . "Decision: ..." "tags" "content"   # save as you go (during work)
+engram add -p . "Fix: ..." "bug,fix" "content"      # after fixing something tricky
+engram sync                                          # push to other machines
 ```
+
+When you use `/compact`, the compaction summary is **automatically saved to engram**. No action needed.
 
 ---
 

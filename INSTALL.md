@@ -76,9 +76,11 @@ If you see that, the base install is working. Continue to [Sync setup](#sync-set
 
 **3.** Initialises `memory.db` (the SQLite database)
 
-**4.** Registers two Claude Code hooks in `~/.claude/settings.json` (backs it up first):
-   - `UserPromptSubmit` — fires at session start, loads recent context
-   - `PreCompact` — fires when context window fills, prompts you to save
+**4.** Registers four Claude Code hooks in `~/.claude/settings.json` (backs it up first):
+   - `UserPromptSubmit` — fires at session start; loads recent context, auto-starts a session with PID tracking
+   - `PreCompact` — fires before `/compact`; injects a reminder into Claude's context to save decisions before compaction
+   - `PostCompact` — fires after `/compact`; automatically saves the compaction summary to engram (no action needed)
+   - `SessionEnd` — fires on exit or `/clear`; auto-closes the active session log
 
 **5.** Adds `~/.claude/engram` to your PATH in `~/.zshrc`
 
@@ -273,7 +275,9 @@ mkdir -p ~/.claude/engram ~/.claude/hooks
 cp engram ~/.claude/engram/engram
 chmod +x ~/.claude/engram/engram
 cp hooks/session_start.py ~/.claude/hooks/engram_session_start.py
+cp hooks/session_end.py   ~/.claude/hooks/engram_session_end.py
 cp hooks/pre_compact.py   ~/.claude/hooks/engram_pre_compact.py
+cp hooks/post_compact.py  ~/.claude/hooks/engram_post_compact.py
 echo 'export PATH="$HOME/.claude/engram:$PATH"' >> ~/.zshrc
 source ~/.zshrc
 engram stats
@@ -284,7 +288,9 @@ Add hooks to `~/.claude/settings.json` (replace `/Users/YOU` with `echo $HOME`):
 {
   "hooks": {
     "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python3 /Users/YOU/.claude/hooks/engram_session_start.py"}]}],
-    "PreCompact":       [{"hooks": [{"type": "command", "command": "python3 /Users/YOU/.claude/hooks/engram_pre_compact.py"}]}]
+    "SessionEnd":       [{"hooks": [{"type": "command", "command": "python3 /Users/YOU/.claude/hooks/engram_session_end.py"}]}],
+    "PreCompact":       [{"hooks": [{"type": "command", "command": "python3 /Users/YOU/.claude/hooks/engram_pre_compact.py"}]}],
+    "PostCompact":      [{"hooks": [{"type": "command", "command": "python3 /Users/YOU/.claude/hooks/engram_post_compact.py"}]}]
   }
 }
 ```
@@ -299,7 +305,9 @@ Copy `CLAUDE_MD_SNIPPET.md` contents into `~/.claude/CLAUDE.md`.
 engram export > ~/engram_backup.json   # save your notes first
 rm -rf ~/.claude/engram
 rm ~/.claude/hooks/engram_session_start.py
+rm ~/.claude/hooks/engram_session_end.py
 rm ~/.claude/hooks/engram_pre_compact.py
+rm ~/.claude/hooks/engram_post_compact.py
 # Edit settings.json — remove the engram hook entries
 # Edit ~/.zshrc — remove the engram PATH line
 # Edit ~/.claude/CLAUDE.md — remove the engram section

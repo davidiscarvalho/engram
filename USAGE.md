@@ -38,28 +38,18 @@ Never skip straight to step 5.
 
 ## The daily workflow
 
-### Starting a session
+### Sessions are automatic
 
-```bash
-engram session start -p .
-```
+Sessions start and end via hooks — no manual calls needed:
 
-This shows recent sessions from all machines so you can orient yourself:
+- **Session start** — fires on your first prompt; loads recent context and starts a session log with PID tracking
+- **Session end** — fires on exit or `/clear`; archives the session log automatically
 
-```
-✓ Session started at 2026-03-18 09:41
-  Project: resumai  |  Machine: mac
+If you want to view what sessions are running or check context: `engram session recent`
 
-── Recent sessions (memory context) ────────────────────
-  [0014] 2026-03-17 @homeserver  Session: resumai (2026-03-17)
-         Deployed new CV pipeline. Redis config still needs tuning.
-  [0013] 2026-03-16 @mac  Session: resumai (2026-03-16)
-         Fixed Clerk redirect issue. Decided on Redis for rate limiting.
-```
+### During the session — save as you go
 
-Notice the `@homeserver` badge — that session was logged on a different machine. engram shows you the full picture across all your machines.
-
-### During the session
+**This is the most important habit.** Don't wait until the end — save notes when decisions happen:
 
 ```bash
 # Bug fix
@@ -75,28 +65,32 @@ engram add "Docker: healthcheck with depends_on" "docker,devops,gotcha" \
   "Use 'condition: service_healthy' not just depends_on. Without it, containers start before DB is ready."
 ```
 
-### Ending a session
+Session logs have `[Claude: fill in...]` placeholders. If Claude didn't fill them in during the session, use `update`:
 
 ```bash
-engram session end
+engram session recent            # find the session note ID
+engram update <id> "<content>"   # replace the placeholder content
+```
+
+### End of day
+
+```bash
 engram sync
 ```
 
-`session end` archives the log. `sync` pushes it to your other machines so the next session — wherever you open Claude Code — has the full picture.
+`sync` pushes everything to your other machines. The next session — wherever you open Claude Code — will have the full picture.
 
-### When context window fills
+### When you use /compact
 
-A hook fires automatically and reminds you:
+Two hooks fire automatically:
 
+**Before compaction** (`PreCompact`) — Claude sees a reminder injected into its context:
 ```
-── engram: Context Compaction Warning ──────────────────────
-
-Context window is filling up. Before compaction erases early context:
-
-1. engram add -p . "Decision: ..." ...
-2. engram add -p . "Insight: ..." ...
-3. engram session end  (then engram session start for fresh context)
+── engram: Save before compaction ──────────────────────────────────────
+Context is about to compact. Save any knowledge not yet in engram: ...
 ```
+
+**After compaction** (`PostCompact`) — the compaction summary is **automatically saved to engram** as a session note. No action needed. Find it with `engram session recent`.
 
 ---
 
@@ -142,13 +136,28 @@ engram add -p . "Title" "tag1,tag2" "content"     # project-scoped
 
 **What doesn't belong:** things easily found in official docs, one-off facts, copy-pasted documentation.
 
+### Updating notes
+
+```bash
+engram update <id> "<new content>"   # replace a note's content
+```
+
+Useful for filling in session logs after the fact:
+```bash
+engram session recent
+engram update 14 "## Session: ...\n\n### What Was Done\n..."
+```
+
 ### Session management
 
 ```bash
-engram session start -p .       # start session, show recent context
-engram session end               # archive session log
 engram session recent            # last 10 sessions (all machines)
 engram session recent --limit 5
+
+# Manual control (usually not needed — hooks handle this automatically)
+engram session start -p .       # start session manually
+engram session end               # end session manually
+engram session end --summary "..." --decisions "..." --files "..." --next-steps "..." --context "..."
 ```
 
 ### Sync
@@ -165,12 +174,12 @@ engram remote show              # show remote and machine name
 ```bash
 # Start of day (on any machine)
 engram pull
-engram session start -p .
 
 # End of day
-engram session end
 engram sync
 ```
+
+Session start/end are handled automatically by hooks.
 
 ### Maintenance
 
@@ -220,6 +229,7 @@ engram search -p . "query"
 engram get <id>
 engram add "Title" "tags" "content"
 engram add -p . "Title" "tags" "content"
+engram update <id> "<new content>"
 engram list
 engram list -p .
 engram list --limit <n>
@@ -234,6 +244,7 @@ engram ingest <file>
 engram session start
 engram session start -p .
 engram session end
+engram session end --summary "..." --decisions "..." --files "..." --next-steps "..." --context "..."
 engram session recent
 engram session recent --limit <n>
 
