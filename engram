@@ -22,8 +22,12 @@ Usage:
   engram ingest <file>                   # curation protocol for a file
   engram update <id> "new content"       # update a note's content
   engram archive <id>                    # soft-delete note
+  engram unarchive <id>                  # reverse a soft-delete
+  engram purge [--older-than N]          # hard-delete archived notes (default: 90 days)
   engram export                          # dump to JSON (stdout)
   engram import <file>                   # restore from JSON
+  engram rebuild-fts                     # rebuild full-text search index
+  engram doctor                          # health check: FTS, UUIDs, sync status
 
   engram remote add <url>                # configure git sync remote
   engram remote show                     # show current remote
@@ -49,7 +53,7 @@ CONFIG_PATH  = ENGRAM_DIR / "config.json"
 SYNC_DIR     = ENGRAM_DIR / "sync"
 SYNC_FILE    = SYNC_DIR / "memory.json"
 
-# Whitelist of columns allowed in import/pull to prevent SQL injection (Fix 3)
+# Whitelist of columns allowed in import/pull to prevent SQL injection
 ALLOWED_COLUMNS = frozenset({
     'uuid', 'type', 'project', 'title', 'tags', 'content',
     'summary', 'machine', 'created_at', 'updated_at', 'archived_at'
@@ -114,7 +118,7 @@ def get_db():
     ENGRAM_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")  # Fix 4: prevent "database is locked"
+    conn.execute("PRAGMA journal_mode=WAL")
     # Migrate first — add new columns before running SCHEMA (which may reference them)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS notes (
@@ -138,13 +142,17 @@ def get_db():
     if 'machine' not in cols:
         conn.execute("ALTER TABLE notes ADD COLUMN machine TEXT")
         conn.commit()
+    # Backfill updated_at=created_at for rows that predate the column —
+    # prevents remote pull from silently overwriting them on first sync
+    conn.execute("UPDATE notes SET updated_at=created_at WHERE updated_at IS NULL")
+    conn.commit()
     # Now run full schema (indexes, FTS, triggers)
     conn.executescript(SCHEMA)
     conn.commit()
     return conn
 
 def make_uuid() -> str:
-    return _uuid.uuid4().hex[:16]  # Fix 10: use uuid4, not SHA-1
+    return _uuid.uuid4().hex[:16]
 
 def ensure_uuids(db):
     rows = db.execute("SELECT id FROM notes WHERE uuid IS NULL").fetchall()
@@ -164,7 +172,7 @@ def fmt_date(dt_str: str) -> str:
         return dt_str or ""
 
 def safe_insert(db, row: dict):
-    """Insert a row using only whitelisted columns (Fix 3: no SQL injection)."""
+    """Insert a row using only whitelisted columns (prevents SQL injection)."""
     filtered = {k: v for k, v in row.items() if k in ALLOWED_COLUMNS}
     filtered.pop('id', None)
     if not filtered:
@@ -172,7 +180,7 @@ def safe_insert(db, row: dict):
     cols = ', '.join(filtered.keys())
     placeholders = ', '.join(['?'] * len(filtered))
     return db.execute(
-        f"INSERT OR IGNORE INTO notes ({cols}) VALUES ({placeholders})",  # Fix 6: OR IGNORE
+        f"INSERT OR IGNORE INTO notes ({cols}) VALUES ({placeholders})",
         list(filtered.values())
     )
 
@@ -192,7 +200,7 @@ def cmd_search(args):
         WHERE notes_fts MATCH ? {where_extra}
         ORDER BY rank LIMIT 10
     """
-    # Fix 5: FTS crash safety — fall back to LIKE on parse error
+    # FTS crash safety — fall back to LIKE on bad query syntax
     try:
         rows = db.execute(sql, params).fetchall()
     except sqlite3.OperationalError:
@@ -295,7 +303,8 @@ def cmd_topics(args):
         "SELECT id, title, summary FROM notes WHERE type='topic' AND archived_at IS NULL ORDER BY title"
     ).fetchall()
     if not rows:
-        print("No topic notes yet. Topics auto-suggest when a concept appears in 3+ notes.")
+        print("No topic notes yet.")
+        print("  Create one: engram add \"Topic: <Name>\" \"topic-note,<tag>\" \"Hub for <concept>...\"")
         return
     print("── Topic Hubs ──")
     for r in rows:
@@ -341,7 +350,6 @@ def cmd_update(args):
 
 def cmd_archive(args):
     db = get_db()
-    # Fix 9: check rowcount to detect missing/already-archived notes
     cursor = db.execute(
         "UPDATE notes SET archived_at=datetime('now') WHERE id=? AND archived_at IS NULL",
         [args.id]
@@ -352,6 +360,32 @@ def cmd_archive(args):
     else:
         print(f"Note {args.id} not found or already archived.")
 
+def cmd_unarchive(args):
+    db = get_db()
+    cursor = db.execute(
+        "UPDATE notes SET archived_at=NULL WHERE id=? AND archived_at IS NOT NULL",
+        [args.id]
+    )
+    db.commit()
+    if cursor.rowcount:
+        print(f"✓ Note {args.id} unarchived.")
+    else:
+        print(f"Note {args.id} not found or not archived.")
+
+def cmd_purge(args):
+    days = args.days
+    cutoff = (datetime.datetime.now() - datetime.timedelta(days=days)).isoformat()
+    db = get_db()
+    cursor = db.execute(
+        "DELETE FROM notes WHERE archived_at IS NOT NULL AND archived_at < ?",
+        [cutoff]
+    )
+    db.commit()
+    if cursor.rowcount:
+        print(f"✓ Purged {cursor.rowcount} archived notes older than {days} days.")
+    else:
+        print(f"No archived notes older than {days} days.")
+
 def cmd_export(args):
     db = get_db()
     ensure_uuids(db)
@@ -361,16 +395,22 @@ def cmd_export(args):
 def cmd_import(args):
     with open(args.file) as f:
         data = json.load(f)
+    if not isinstance(data, list):
+        print("✗ Import file must be a JSON array.")
+        return
     db = get_db()
     inserted = skipped = 0
     for r in data:
-        cursor = safe_insert(db, r)  # Fix 3: whitelist; Fix 6: OR IGNORE
+        if not isinstance(r, dict):
+            skipped += 1
+            continue
+        cursor = safe_insert(db, r)
         if cursor and cursor.rowcount:
             inserted += 1
         else:
             skipped += 1
     db.commit()
-    print(f"✓ Imported {inserted} notes ({skipped} duplicates skipped).")
+    print(f"✓ Imported {inserted} notes ({skipped} duplicates/invalid skipped).")
 
 def cmd_ingest(args):
     print(f"""
@@ -396,13 +436,115 @@ Quality checklist:
 Begin analysis of: {args.file}
 """)
 
+def cmd_rebuild_fts(args):
+    db = get_db()
+    # FTS5 'rebuild' re-reads all rows from the content table and rebuilds the index
+    db.execute("INSERT INTO notes_fts(notes_fts) VALUES('rebuild')")
+    db.commit()
+    count = db.execute("SELECT COUNT(*) FROM notes WHERE archived_at IS NULL").fetchone()[0]
+    print(f"✓ FTS index rebuilt ({count} active notes indexed).")
+
+def cmd_doctor(args):
+    db = get_db()
+    ensure_uuids(db)
+
+    total    = db.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
+    active   = db.execute("SELECT COUNT(*) FROM notes WHERE archived_at IS NULL").fetchone()[0]
+    archived = total - active
+
+    # FTS row count
+    try:
+        fts_count = db.execute("SELECT COUNT(*) FROM notes_fts").fetchone()[0]
+    except sqlite3.OperationalError:
+        fts_count = -1
+
+    # Duplicate UUIDs
+    dupes = db.execute(
+        "SELECT uuid, COUNT(*) c FROM notes WHERE uuid IS NOT NULL GROUP BY uuid HAVING c > 1"
+    ).fetchall()
+
+    # NULL UUIDs
+    null_uuids = db.execute("SELECT COUNT(*) FROM notes WHERE uuid IS NULL").fetchone()[0]
+
+    # NULL updated_at
+    null_updated = db.execute("SELECT COUNT(*) FROM notes WHERE updated_at IS NULL").fetchone()[0]
+
+    cfg     = load_config()
+    remote  = cfg.get('remote')
+    sync_ok = SYNC_DIR.exists() and (SYNC_DIR / ".git").exists()
+
+    print("── engram doctor ──────────────────────────────────────")
+    print(f"  Notes total:    {total}  (active: {active}, archived: {archived})")
+
+    issues = 0
+
+    # FTS check — FTS indexes all rows (including archived), so compare against total
+    if fts_count == -1:
+        print(f"  ✗ FTS table missing — run: engram rebuild-fts")
+        issues += 1
+    elif fts_count != total:
+        print(f"  ✗ FTS mismatch: {total} notes, {fts_count} FTS rows — run: engram rebuild-fts")
+        issues += 1
+    else:
+        print(f"  ✓ FTS index consistent ({fts_count} rows)")
+
+    # UUID checks
+    if dupes:
+        print(f"  ✗ Duplicate UUIDs: {len(dupes)} — manual inspection needed")
+        for d in dupes:
+            print(f"      uuid={d['uuid']} appears {d['c']} times")
+        issues += 1
+    else:
+        print(f"  ✓ No duplicate UUIDs")
+
+    if null_uuids:
+        print(f"  ✗ Notes missing UUID: {null_uuids} — run: engram export > backup.json && engram import backup.json")
+        issues += 1
+    else:
+        print(f"  ✓ All notes have UUIDs")
+
+    if null_updated:
+        print(f"  ✗ Notes missing updated_at: {null_updated}")
+        issues += 1
+    else:
+        print(f"  ✓ All timestamps populated")
+
+    # Sync check
+    if not remote:
+        print(f"  ⚠ No sync remote — run: engram remote add <url>")
+    elif not sync_ok:
+        print(f"  ⚠ Remote configured but not cloned — run: engram pull")
+        issues += 1
+    else:
+        print(f"  ✓ Sync remote: {remote}")
+
+    # Hook log
+    log_path = ENGRAM_DIR / "hook.log"
+    if log_path.exists():
+        size = log_path.stat().st_size
+        print(f"  ✓ hook.log exists ({size // 1024} KB) — tail: tail -f {log_path}")
+    else:
+        print(f"  ⚠ hook.log missing — run install.sh or: touch {log_path}")
+
+    print()
+    if issues == 0:
+        print("  ✓ All checks passed.")
+    else:
+        print(f"  {issues} issue(s) found.")
+
 # ─── SESSION COMMANDS ─────────────────────────────────────────────────────────
 
 def cmd_session_start(args):
     project = resolve_project(args)
     cwd = os.getcwd()
     now = datetime.datetime.now().isoformat()
-    session = {"started_at": now, "project": project or Path(cwd).name, "cwd": cwd, "pid": os.getpid()}
+    # Use session_id (not pid) for consistency with the hook's session identity
+    session = {
+        "started_at": now,
+        "project": project or Path(cwd).name,
+        "cwd": cwd,
+        "session_id": make_uuid(),
+    }
     SESSION_PATH.write_text(json.dumps(session, indent=2))
     print(f"✓ Session started at {now[:16].replace('T',' ')}")
     print(f"  Project: {session['project']}  |  Machine: {machine_name()}")
@@ -485,7 +627,6 @@ Duration: {duration_m:.0f}min
 def cmd_session_recent(args):
     db = get_db()
     limit = getattr(args, 'limit', 10)
-    # Fix 8: include 'compact' type so compaction summaries appear here
     rows = db.execute(
         "SELECT id, project, title, summary, created_at, machine FROM notes "
         "WHERE type IN ('session', 'compact') AND archived_at IS NULL ORDER BY id DESC LIMIT ?",
@@ -516,7 +657,7 @@ def require_remote():
     remote = load_config().get("remote")
     if not remote:
         print("✗ No sync remote configured.")
-        print("  Run: engram remote add git@github.com:davidiscarvalho/engram-memory.git")
+        print("  Run: engram remote add git@github.com:<user>/engram-memory.git")
         sys.exit(1)
     return remote
 
@@ -603,7 +744,6 @@ def cmd_pull(args):
     db = get_db()
     ensure_uuids(db)
 
-    # Fix 7: upsert by updated_at (not insert-only)
     new_count = updated_count = 0
     for r in remote_data:
         uid = r.get("uuid")
@@ -611,7 +751,7 @@ def cmd_pull(args):
             continue
         local = db.execute("SELECT id, updated_at FROM notes WHERE uuid=?", [uid]).fetchone()
         if not local:
-            safe_insert(db, r)  # Fix 3: whitelist columns
+            safe_insert(db, r)
             new_count += 1
         else:
             remote_updated = r.get("updated_at", "")
@@ -638,7 +778,16 @@ def cmd_sync(args):
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 
 def resolve_project(args):
-    # Fix 11: use git root name to avoid same-name dir collisions
+    """
+    Resolve project identity. Priority:
+    1. Explicit -p <name> argument
+    2. Git root folder name (avoids subdir collisions like src/, app/)
+    3. Current directory name (fallback for non-git dirs)
+
+    Note: git-remote-based identity (owner/repo) is the correct long-term
+    approach for cross-machine stability, but requires a data migration since
+    existing notes are stored by folder name. Tracked for a future release.
+    """
     if hasattr(args, 'project'):
         p = args.project
         if p and p != '.':
@@ -669,10 +818,14 @@ def build_parser():
     sub.add_parser('tags'); sub.add_parser('topics'); sub.add_parser('stats')
 
     pu = sub.add_parser('update'); pu.add_argument('id', type=int); pu.add_argument('content')
-    par = sub.add_parser('archive'); par.add_argument('id', type=int)
+    par = sub.add_parser('archive');   par.add_argument('id', type=int)
+    pun = sub.add_parser('unarchive'); pun.add_argument('id', type=int)
+    ppu = sub.add_parser('purge');     ppu.add_argument('--older-than', type=int, default=90, dest='days')
     sub.add_parser('export')
     pi = sub.add_parser('import'); pi.add_argument('file')
     pin = sub.add_parser('ingest'); pin.add_argument('file')
+    sub.add_parser('rebuild-fts')
+    sub.add_parser('doctor')
 
     psess = sub.add_parser('session')
     psess_sub = psess.add_subparsers(dest='session_cmd')
@@ -698,8 +851,10 @@ def main():
     dispatch = {
         'search': cmd_search, 'get': cmd_get, 'add': cmd_add, 'list': cmd_list,
         'tags': cmd_tags, 'topics': cmd_topics, 'stats': cmd_stats,
-        'update': cmd_update, 'archive': cmd_archive, 'export': cmd_export, 'import': cmd_import,
-        'ingest': cmd_ingest, 'push': cmd_push, 'pull': cmd_pull, 'sync': cmd_sync,
+        'update': cmd_update, 'archive': cmd_archive, 'unarchive': cmd_unarchive,
+        'purge': cmd_purge, 'export': cmd_export, 'import': cmd_import,
+        'ingest': cmd_ingest, 'rebuild-fts': cmd_rebuild_fts, 'doctor': cmd_doctor,
+        'push': cmd_push, 'pull': cmd_pull, 'sync': cmd_sync,
     }
 
     if args.cmd == 'session':

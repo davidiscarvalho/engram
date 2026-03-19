@@ -95,6 +95,8 @@ engram search -p . "query"      # current project + global
 
 Notes from other machines show an `@machine` badge. If your query contains special characters (quotes, dashes), the search falls back to a simple LIKE match automatically.
 
+Project scope (`-p .`) uses the git repository root name (not the subdirectory you're in). Running from `src/` inside `myproject/` still resolves to `myproject`.
+
 ### Reading
 
 ```bash
@@ -174,10 +176,15 @@ engram sync
 ### Maintenance
 
 ```bash
-engram archive <id>             # soft-delete (excluded from search, never deleted)
+engram archive <id>             # soft-delete (excluded from search)
+engram unarchive <id>           # reverse a soft-delete
+engram purge                    # hard-delete archived notes older than 90 days
+engram purge --older-than 30    # hard-delete archived notes older than 30 days
 engram export > backup.json     # full JSON export
 engram import backup.json       # restore from export (duplicates skipped)
 engram ingest <file>            # curation protocol for a document
+engram rebuild-fts              # rebuild full-text search index (after corruption or migration)
+engram doctor                   # health check: FTS consistency, UUIDs, sync status
 ```
 
 ---
@@ -239,9 +246,13 @@ engram tags
 engram topics
 engram stats
 engram archive <id>
+engram unarchive <id>
+engram purge [--older-than <days>]
 engram export > backup.json
 engram import backup.json
 engram ingest <file>
+engram rebuild-fts
+engram doctor
 
 engram session start
 engram session start -p .
