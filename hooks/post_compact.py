@@ -11,13 +11,21 @@ import json
 import os
 import sqlite3
 import datetime
-import hashlib
-import random
+import uuid as _uuid
 from pathlib import Path
 
 ENGRAM_DIR   = Path.home() / ".claude" / "engram"
 DB_PATH      = ENGRAM_DIR / "memory.db"
+LOG_PATH     = ENGRAM_DIR / "hook.log"
 SESSION_PATH = ENGRAM_DIR / ".current_session.json"
+
+
+def log(msg: str):
+    try:
+        with open(LOG_PATH, "a") as f:
+            f.write(f"[{datetime.datetime.now().isoformat()}] [post_compact] {msg}\n")
+    except Exception:
+        pass
 
 
 def machine_name() -> str:
@@ -31,8 +39,7 @@ def machine_name() -> str:
 
 
 def make_uuid() -> str:
-    raw = f"{datetime.datetime.now().isoformat()}{random.random()}{machine_name()}"
-    return hashlib.sha1(raw.encode()).hexdigest()[:16]
+    return _uuid.uuid4().hex[:16]
 
 
 def make_summary(content: str, length: int = 180) -> str:
@@ -54,7 +61,7 @@ def main():
     try:
         payload = json.loads(sys.stdin.read())
     except Exception:
-        pass
+        log("Failed to parse stdin payload")
 
     summary = payload.get("summary", "")
     if not summary or not DB_PATH.exists():
@@ -68,14 +75,16 @@ def main():
         tags    = f"compact,session,{project}"
 
         conn = sqlite3.connect(DB_PATH)
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute(
             "INSERT INTO notes (uuid, type, project, title, tags, content, summary, machine) VALUES (?,?,?,?,?,?,?,?)",
             [make_uuid(), "compact", project, title, tags, content, make_summary(summary), machine_name()]
         )
         conn.commit()
         conn.close()
-    except Exception:
-        pass
+        log(f"Saved compact note for project '{project}'")
+    except Exception as e:
+        log(f"Error saving compact note: {e}")
 
     sys.exit(0)
 

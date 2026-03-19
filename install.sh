@@ -14,6 +14,8 @@ echo ""
 echo "→ Creating directories..."
 mkdir -p "$ENGRAM_DIR"
 mkdir -p "$HOOKS_DIR"
+touch "$ENGRAM_DIR/hook.log"
+chmod 600 "$ENGRAM_DIR/hook.log"
 
 echo "→ Installing engram CLI..."
 cp "$SCRIPT_DIR/engram" "$ENGRAM_DIR/engram"

@@ -17,14 +17,15 @@ Three types of things live in memory:
 | Type | What it is | Created by |
 |------|-----------|-----------|
 | **Note** | Atomic knowledge: a decision, a fix, a pattern, a gotcha | `engram add` |
-| **Session log** | Archive of a work session: what was built, decided, and what's next | `engram session end` |
-| **Topic hub** | Hub page for a concept that appears across many notes | Claude suggests at 3+ occurrences |
+| **Session log** | Archive of a work session: what was built, decided, and what's next | auto (session end hook) |
+| **Compact summary** | Knowledge preserved from a `/compact` operation | auto (PostCompact hook) |
+| **Topic hub** | Hub page for a concept that appears across many notes | `engram add "Topic: ..."` |
 
 ---
 
 ## The memory-first protocol
 
-After installing, `~/.claude/CLAUDE.md` contains a protocol telling Claude Code to follow this search order:
+After installing, `~/.claude/CLAUDE.md` contains a protocol telling Claude Code to search in this order:
 
 1. `engram topics` — check hub notes for recurring concepts
 2. `engram list -p .` — check what's known about this project
@@ -42,10 +43,10 @@ Never skip straight to step 5.
 
 Sessions start and end via hooks — no manual calls needed:
 
-- **Session start** — fires on your first prompt; loads recent context and starts a session log with PID tracking
-- **Session end** — fires on exit or `/clear`; archives the session log automatically
+- **Every prompt** — the `UserPromptSubmit` hook fires, injecting recent sessions and project notes into Claude's context. When the Claude session ID changes, the previous session is automatically archived and a new one starts.
+- **Session end** — fires on exit or `/clear`; archives the session log automatically.
 
-If you want to view what sessions are running or check context: `engram session recent`
+Session context appears as a system reminder in every conversation. Claude sees your recent sessions and project notes before each response.
 
 ### During the session — save as you go
 
@@ -65,13 +66,6 @@ engram add "Docker: healthcheck with depends_on" "docker,devops,gotcha" \
   "Use 'condition: service_healthy' not just depends_on. Without it, containers start before DB is ready."
 ```
 
-Session logs have `[Claude: fill in...]` placeholders. If Claude didn't fill them in during the session, use `update`:
-
-```bash
-engram session recent            # find the session note ID
-engram update <id> "<content>"   # replace the placeholder content
-```
-
 ### End of day
 
 ```bash
@@ -84,13 +78,9 @@ engram sync
 
 Two hooks fire automatically:
 
-**Before compaction** (`PreCompact`) — Claude sees a reminder injected into its context:
-```
-── engram: Save before compaction ──────────────────────────────────────
-Context is about to compact. Save any knowledge not yet in engram: ...
-```
+**Before compaction** (`PreCompact`) — Claude sees a reminder injected into its context to save any pending notes before the context window shrinks.
 
-**After compaction** (`PostCompact`) — the compaction summary is **automatically saved to engram** as a session note. No action needed. Find it with `engram session recent`.
+**After compaction** (`PostCompact`) — the compaction summary is **automatically saved to engram** as a `compact` note. Find it with `engram session recent`.
 
 ---
 
@@ -103,7 +93,7 @@ engram search "query"           # all active notes
 engram search -p . "query"      # current project + global
 ```
 
-Notes from other machines show an `@machine` badge so you know where they came from. Supports multiple terms (`engram search "auth redirect"`), prefix matching (`engram search "dock"`), and column targeting (`engram search "title:clerk"`).
+Notes from other machines show an `@machine` badge. If your query contains special characters (quotes, dashes), the search falls back to a simple LIKE match automatically.
 
 ### Reading
 
@@ -151,12 +141,12 @@ engram update 14 "## Session: ...\n\n### What Was Done\n..."
 ### Session management
 
 ```bash
-engram session recent            # last 10 sessions (all machines)
+engram session recent            # last 10 sessions + compact summaries
 engram session recent --limit 5
 
 # Manual control (usually not needed — hooks handle this automatically)
-engram session start -p .       # start session manually
-engram session end               # end session manually
+engram session start -p .
+engram session end
 engram session end --summary "..." --decisions "..." --files "..." --next-steps "..." --context "..."
 ```
 
@@ -164,11 +154,13 @@ engram session end --summary "..." --decisions "..." --files "..." --next-steps 
 
 ```bash
 engram push                     # export → commit → push to GitHub
-engram pull                     # pull from GitHub → merge new notes
+engram pull                     # pull from GitHub → merge/update notes
 engram sync                     # pull then push (full bidirectional)
 engram remote add <url>         # set the git remote
 engram remote show              # show remote and machine name
 ```
+
+`pull` uses upsert semantics: new notes are inserted, existing notes are updated if the remote version is newer (by `updated_at`).
 
 **Recommended flow:**
 ```bash
@@ -179,14 +171,12 @@ engram pull
 engram sync
 ```
 
-Session start/end are handled automatically by hooks.
-
 ### Maintenance
 
 ```bash
 engram archive <id>             # soft-delete (excluded from search, never deleted)
 engram export > backup.json     # full JSON export
-engram import backup.json       # restore from export
+engram import backup.json       # restore from export (duplicates skipped)
 engram ingest <file>            # curation protocol for a document
 ```
 
@@ -218,6 +208,18 @@ engram ingest /path/to/doc.md
 ```
 
 Prints a curation protocol — Claude Code reads the document and adds 5–15 distilled notes. Best for design docs, long READMEs, architecture documents.
+
+---
+
+## Debugging hooks
+
+Hook activity is logged to `~/.claude/engram/hook.log`. If context isn't appearing or sessions aren't being saved:
+
+```bash
+tail -f ~/.claude/engram/hook.log
+```
+
+Each hook logs its activity with timestamps, so you can see exactly what's happening on each prompt.
 
 ---
 

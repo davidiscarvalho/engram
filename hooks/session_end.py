@@ -6,8 +6,21 @@ Auto-archives the active engram session.
 """
 import sys
 import json
+import datetime
 import subprocess
 from pathlib import Path
+
+LOG_PATH     = Path.home() / ".claude" / "engram" / "hook.log"
+ENGRAM_CLI   = Path.home() / ".claude" / "engram" / "engram"
+SESSION_FILE = Path.home() / ".claude" / "engram" / ".current_session.json"
+
+
+def log(msg: str):
+    try:
+        with open(LOG_PATH, "a") as f:
+            f.write(f"[{datetime.datetime.now().isoformat()}] [session_end] {msg}\n")
+    except Exception:
+        pass
 
 
 def main():
@@ -16,15 +29,13 @@ def main():
     except Exception:
         pass
 
-    engram_cli   = Path.home() / ".claude" / "engram" / "engram"
-    session_file = Path.home() / ".claude" / "engram" / ".current_session.json"
-
-    if session_file.exists() and engram_cli.exists():
+    if SESSION_FILE.exists() and ENGRAM_CLI.exists():
         try:
-            subprocess.run(["python3", str(engram_cli), "session", "end"],
+            subprocess.run(["python3", str(ENGRAM_CLI), "session", "end"],
                            capture_output=True)
-        except Exception:
-            pass
+            log("Session end triggered successfully")
+        except Exception as e:
+            log(f"Error ending session: {e}")
     sys.exit(0)
 
 

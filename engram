@@ -556,7 +556,11 @@ def cmd_push(args):
 
     print("── engram push ──────────────────────────────────────────")
     print("  Pulling latest first...")
-    git("pull", "--rebase")
+    _, pull_rc = git("pull", "--rebase")
+    if pull_rc != 0:
+        print("✗ Pull failed before push — aborting to avoid overwriting remote changes.")
+        print("  Fix the sync repo manually, then retry.")
+        sys.exit(1)
 
     rows = db.execute("SELECT * FROM notes").fetchall()
     data = [dict(r) for r in rows]
@@ -572,10 +576,13 @@ def cmd_push(args):
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     msg = f"sync: {machine_name()} @ {now} ({len(data)} notes)"
     git("commit", "-m", msg)
-    _, rc = git("push")
-    if rc != 0:
-        git("push", "--set-upstream", "origin", "main")
-    print(f"  ✓ Pushed: {msg}")
+    _, push_rc = git("push")
+    if push_rc != 0:
+        _, push_rc = git("push", "--set-upstream", "origin", "main")
+    if push_rc == 0:
+        print(f"  ✓ Pushed: {msg}")
+    else:
+        print(f"✗ Push failed. Check your SSH key and remote: engram remote show")
 
 def cmd_pull(args):
     remote = require_remote()

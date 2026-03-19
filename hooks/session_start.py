@@ -15,7 +15,16 @@ import subprocess as _sp
 from pathlib import Path
 
 DB_PATH      = Path.home() / ".claude" / "engram" / "memory.db"
+LOG_PATH     = Path.home() / ".claude" / "engram" / "hook.log"
 SESSION_PATH = Path.home() / ".claude" / "engram" / ".current_session.json"
+
+
+def log(msg: str):
+    try:
+        with open(LOG_PATH, "a") as f:
+            f.write(f"[{datetime.datetime.now().isoformat()}] [session_start] {msg}\n")
+    except Exception:
+        pass
 
 
 def main():
@@ -23,7 +32,7 @@ def main():
     try:
         payload = json.loads(sys.stdin.read())
     except Exception:
-        pass
+        log("Failed to parse stdin payload")
 
     if not DB_PATH.exists():
         sys.exit(0)
@@ -32,6 +41,7 @@ def main():
 
     try:
         conn = sqlite3.connect(DB_PATH)
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.row_factory = sqlite3.Row
 
         try:
@@ -43,7 +53,7 @@ def main():
         except Exception:
             cwd_project = Path(os.getcwd()).name
 
-        # ── Session identity (Fix 2): use session_id, not PID ──────────────
+        # ── Session identity: use session_id, not PID ─────────────────────
         def _end_previous_session():
             engram_cli = Path.home() / ".claude" / "engram" / "engram"
             if engram_cli.exists():
@@ -60,17 +70,18 @@ def main():
 
         if not SESSION_PATH.exists():
             _new_session(current_session_id)
+            log(f"New session started: project={cwd_project}")
         else:
             existing = json.loads(SESSION_PATH.read_text())
             stored_sid = existing.get("session_id", "")
             if stored_sid and stored_sid == current_session_id:
                 pass  # same Claude session — just output context below
             else:
-                # Different (or missing) session_id → real session boundary
+                log(f"Session boundary detected (id changed), ending previous session")
                 _end_previous_session()
                 _new_session(current_session_id)
 
-        # ── Build context string (Fix 1) ────────────────────────────────────
+        # ── Build context ─────────────────────────────────────────────────
         lines = ["── engram: Memory Context ───────────────────────────────"]
 
         recent = conn.execute(
@@ -104,16 +115,17 @@ def main():
 
         context = "\n".join(lines)
 
-        # ── Output context to Claude (Fix 1) ────────────────────────────────
+        # ── Output context to Claude ──────────────────────────────────────
         print(json.dumps({
             "hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit",
                 "additionalContext": context
             }
         }))
+        log(f"Context injected: project={cwd_project}, {len(recent)} sessions, {len(proj_notes)} notes")
 
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"Error: {e}")
 
     sys.exit(0)
 
