@@ -57,17 +57,28 @@ engram add -p . "Decision: <topic>" "decision,architecture" "<what was decided a
 
 ### Session Logging
 
-At the start of each work session:
+Sessions start and end **automatically via hooks** — no manual calls needed.
+
+**CRITICAL — session logs stay empty by default.** The hooks handle timestamps but cannot write content. Capture knowledge with **incremental atomic notes throughout the session** — don't wait until the end:
+
 ```bash
-engram session start -p .
+# After a key decision (do this as it happens)
+engram add -p . "Decision: <topic>" "decision,<tag>" "<what was decided and why>"
+
+# After completing a major feature or batch of work
+engram add -p . "Impl: <feature>" "impl,<tag>" "<what was built, key choices made>"
+
+# After fixing a tricky bug
+engram add -p . "Fix: <bug>" "bug,fix" "<root cause and solution>"
 ```
 
-At the end (or before context compacts):
+If a session log was created but left empty, fill it in with `update`:
 ```bash
-engram session end
+engram session recent        # find the session note ID
+engram update <id> "<content replacing the [Claude: fill in...] placeholders>"
 ```
 
-Then fill in the session log: `engram get <new_id>`
+**When to add a note:** after any non-obvious decision, major completion, tricky fix, or surprising discovery. The session log is just metadata — the atomic notes ARE the memory.
 
 ### Topic Notes
 

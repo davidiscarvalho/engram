@@ -20,6 +20,7 @@ Usage:
   engram session end                     # archive session
   engram session recent                  # show recent sessions
   engram ingest <file>                   # curation protocol for a file
+  engram update <id> "new content"       # update a note's content
   engram archive <id>                    # soft-delete note
   engram export                          # dump to JSON (stdout)
   engram import <file>                   # restore from JSON
@@ -289,6 +290,19 @@ def cmd_stats(args):
     print(f"  DB path:          {DB_PATH}")
     print(f"  Sync remote:      {cfg.get('remote', 'not configured')}")
 
+def cmd_update(args):
+    db = get_db()
+    row = db.execute("SELECT id, title FROM notes WHERE id = ?", [args.id]).fetchone()
+    if not row:
+        print(f"Note {args.id} not found.")
+        return
+    db.execute(
+        "UPDATE notes SET content=?, summary=?, updated_at=datetime('now') WHERE id=?",
+        [args.content, make_summary(args.content), args.id]
+    )
+    db.commit()
+    print(f"✓ Note {args.id} updated: {row['title']}")
+
 def cmd_archive(args):
     db = get_db()
     db.execute("UPDATE notes SET archived_at=datetime('now') WHERE id=?", [args.id])
@@ -386,6 +400,8 @@ def cmd_session_end(args):
     what_done  = getattr(args, 'summary',    None) or "[Claude: fill in what was accomplished]"
     decisions  = getattr(args, 'decisions',  None) or "[Claude: fill in key decisions and rationale]"
     next_steps = getattr(args, 'next_steps', None) or "[Claude: fill in what to pick up next time]"
+    files      = getattr(args, 'files',      None) or "[Claude: list key files modified]"
+    context    = getattr(args, 'context',    None) or "[Claude: anything future-you needs to know]"
 
     content = f"""## Session: {started} → {ended}
 Project: {project}
@@ -400,13 +416,13 @@ Duration: {duration_m:.0f}min
 {decisions}
 
 ### Files Changed
-[Claude: list key files modified]
+{files}
 
 ### Next Steps
 {next_steps}
 
 ### Context Notes
-[Claude: anything future-you needs to know]
+{context}
 """
     title = f"Session: {project} ({started[:10]})"
     db = get_db()
@@ -416,9 +432,11 @@ Duration: {duration_m:.0f}min
     )
     db.commit()
     SESSION_PATH.unlink(missing_ok=True)
-    print(f"✓ Session logged as note {cursor.lastrowid:04d}")
-    print(f"  View it: engram get {cursor.lastrowid}")
-    print("── Ask Claude to fill in the sections above.")
+    nid = cursor.lastrowid
+    print(f"✓ Session logged as note {nid:04d}")
+    print(f"  View:   engram get {nid}")
+    if "[Claude:" in content:
+        print(f"  Update: engram update {nid} \"<full content>\"  (fill in the empty sections)")
 
 def cmd_session_recent(args):
     db = get_db()
@@ -583,6 +601,7 @@ def build_parser():
 
     sub.add_parser('tags'); sub.add_parser('topics'); sub.add_parser('stats')
 
+    pu = sub.add_parser('update'); pu.add_argument('id', type=int); pu.add_argument('content')
     par = sub.add_parser('archive'); par.add_argument('id', type=int)
     sub.add_parser('export')
     pi = sub.add_parser('import'); pi.add_argument('file')
@@ -591,7 +610,7 @@ def build_parser():
     psess = sub.add_parser('session')
     psess_sub = psess.add_subparsers(dest='session_cmd')
     pss = psess_sub.add_parser('start'); pss.add_argument('-p','--project',default=None,metavar='PROJECT'); pss.add_argument('--goal',default=None)
-    pse = psess_sub.add_parser('end');   pse.add_argument('--summary',default=None); pse.add_argument('--decisions',default=None); pse.add_argument('--next-steps',default=None)
+    pse = psess_sub.add_parser('end');   pse.add_argument('--summary',default=None); pse.add_argument('--decisions',default=None); pse.add_argument('--next-steps',default=None); pse.add_argument('--files',default=None); pse.add_argument('--context',default=None)
     psr = psess_sub.add_parser('recent'); psr.add_argument('--limit',type=int,default=10)
 
     premote = sub.add_parser('remote')
@@ -612,7 +631,7 @@ def main():
     dispatch = {
         'search': cmd_search, 'get': cmd_get, 'add': cmd_add, 'list': cmd_list,
         'tags': cmd_tags, 'topics': cmd_topics, 'stats': cmd_stats,
-        'archive': cmd_archive, 'export': cmd_export, 'import': cmd_import,
+        'update': cmd_update, 'archive': cmd_archive, 'export': cmd_export, 'import': cmd_import,
         'ingest': cmd_ingest, 'push': cmd_push, 'pull': cmd_pull, 'sync': cmd_sync,
     }
 

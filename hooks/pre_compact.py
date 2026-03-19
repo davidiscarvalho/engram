@@ -18,16 +18,20 @@ def main():
     reminder = """
 ── engram: Context Compaction Warning ────────────────────────────────────
 
-Context window is filling up. Before compaction erases early context:
+Context window is filling up. Save knowledge NOW — before compaction:
 
-1. Save any key decisions made so far:
+1. Key decisions (most important):
    engram add -p . "Decision: <topic>" "decision,<tags>" "<what was decided and why>"
 
-2. Save any important discoveries:
+2. Important discoveries:
    engram add -p . "Insight: <topic>" "insight,<tags>" "<what you learned>"
 
-3. Log session progress if needed:
-   engram session end   (then: engram session start for a fresh session)
+3. Completed work summary:
+   engram add -p . "Impl: <feature>" "impl,<tags>" "<what was built, key choices>"
+
+4. Fill in the current session log if it has empty sections:
+   engram session recent   → get the session note ID
+   engram update <id> "<full content replacing the [Claude: fill in...] placeholders>"
 
 ──────────────────────────────────────────────────────────────────────────
 """
