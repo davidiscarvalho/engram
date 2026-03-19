@@ -104,14 +104,25 @@ with open(settings_path, "w") as f:
 print("  Hooks registered in settings.json")
 PYEOF
 
-ZSHRC="$HOME/.zshrc"
-if ! grep -qF "/.claude/engram" "$ZSHRC" 2>/dev/null; then
-    echo "" >> "$ZSHRC"
-    echo "# engram — persistent memory for Claude Code" >> "$ZSHRC"
-    echo 'export PATH="$HOME/.claude/engram:$PATH"' >> "$ZSHRC"
-    echo "→ Added engram to PATH in ~/.zshrc"
+# Fix 12: detect shell and write to the right rc file
+if [[ "$SHELL" == */fish ]]; then
+    RC_FILE="$HOME/.config/fish/config.fish"
+    PATH_LINE="set -gx PATH \"$HOME/.claude/engram\" \$PATH"
+elif [[ "$SHELL" == */bash ]]; then
+    RC_FILE="$HOME/.bash_profile"
+    PATH_LINE="export PATH=\"\$HOME/.claude/engram:\$PATH\""
 else
-    echo "→ PATH already configured in ~/.zshrc"
+    RC_FILE="$HOME/.zshrc"
+    PATH_LINE="export PATH=\"\$HOME/.claude/engram:\$PATH\""
+fi
+
+if ! grep -qF "/.claude/engram" "$RC_FILE" 2>/dev/null; then
+    echo "" >> "$RC_FILE"
+    echo "# engram — persistent memory for Claude Code" >> "$RC_FILE"
+    echo "$PATH_LINE" >> "$RC_FILE"
+    echo "→ Added engram to PATH in $RC_FILE"
+else
+    echo "→ PATH already configured in $RC_FILE"
 fi
 
 CLAUDE_MD="$CLAUDE_DIR/CLAUDE.md"
@@ -151,7 +162,7 @@ print('  ✓ Hooks registered in settings.json')
 echo ""
 echo "── Done ─────────────────────────────────────────────────────"
 echo ""
-echo "  Reload your shell:      source ~/.zshrc"
+echo "  Reload your shell:      source $RC_FILE"
 echo "  Test it:                engram stats"
 echo "  Add your first note:    engram add \"Hello\" \"test\" \"My first engram note\""
 echo "  Start a session:        engram session start"

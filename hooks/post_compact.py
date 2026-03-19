@@ -70,7 +70,7 @@ def main():
         conn = sqlite3.connect(DB_PATH)
         conn.execute(
             "INSERT INTO notes (uuid, type, project, title, tags, content, summary, machine) VALUES (?,?,?,?,?,?,?,?)",
-            [make_uuid(), "session", project, title, tags, content, make_summary(summary), machine_name()]
+            [make_uuid(), "compact", project, title, tags, content, make_summary(summary), machine_name()]
         )
         conn.commit()
         conn.close()

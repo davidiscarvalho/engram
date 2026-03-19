@@ -39,6 +39,7 @@ import sqlite3
 import datetime
 import argparse
 import subprocess
+import uuid as _uuid
 from pathlib import Path
 
 ENGRAM_DIR   = Path.home() / ".claude" / "engram"
@@ -47,6 +48,12 @@ SESSION_PATH = ENGRAM_DIR / ".current_session.json"
 CONFIG_PATH  = ENGRAM_DIR / "config.json"
 SYNC_DIR     = ENGRAM_DIR / "sync"
 SYNC_FILE    = SYNC_DIR / "memory.json"
+
+# Whitelist of columns allowed in import/pull to prevent SQL injection (Fix 3)
+ALLOWED_COLUMNS = frozenset({
+    'uuid', 'type', 'project', 'title', 'tags', 'content',
+    'summary', 'machine', 'created_at', 'updated_at', 'archived_at'
+})
 
 # ─── CONFIG ───────────────────────────────────────────────────────────────────
 
@@ -107,6 +114,7 @@ def get_db():
     ENGRAM_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")  # Fix 4: prevent "database is locked"
     # Migrate first — add new columns before running SCHEMA (which may reference them)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS notes (
@@ -136,9 +144,7 @@ def get_db():
     return conn
 
 def make_uuid() -> str:
-    import hashlib, time, random
-    raw = f"{time.time()}{random.random()}{machine_name()}"
-    return hashlib.sha1(raw.encode()).hexdigest()[:16]
+    return _uuid.uuid4().hex[:16]  # Fix 10: use uuid4, not SHA-1
 
 def ensure_uuids(db):
     rows = db.execute("SELECT id FROM notes WHERE uuid IS NULL").fetchall()
@@ -157,6 +163,19 @@ def fmt_date(dt_str: str) -> str:
     except Exception:
         return dt_str or ""
 
+def safe_insert(db, row: dict):
+    """Insert a row using only whitelisted columns (Fix 3: no SQL injection)."""
+    filtered = {k: v for k, v in row.items() if k in ALLOWED_COLUMNS}
+    filtered.pop('id', None)
+    if not filtered:
+        return None
+    cols = ', '.join(filtered.keys())
+    placeholders = ', '.join(['?'] * len(filtered))
+    return db.execute(
+        f"INSERT OR IGNORE INTO notes ({cols}) VALUES ({placeholders})",  # Fix 6: OR IGNORE
+        list(filtered.values())
+    )
+
 # ─── CORE COMMANDS ────────────────────────────────────────────────────────────
 
 def cmd_search(args):
@@ -173,7 +192,22 @@ def cmd_search(args):
         WHERE notes_fts MATCH ? {where_extra}
         ORDER BY rank LIMIT 10
     """
-    rows = db.execute(sql, params).fetchall()
+    # Fix 5: FTS crash safety — fall back to LIKE on parse error
+    try:
+        rows = db.execute(sql, params).fetchall()
+    except sqlite3.OperationalError:
+        like = f"%{args.query}%"
+        like_params = [like, like, like]
+        extra = ""
+        if project:
+            extra = " AND (project = ? OR project IS NULL)"
+            like_params.append(project)
+        rows = db.execute(
+            f"SELECT id, type, project, title, tags, summary, machine FROM notes "
+            f"WHERE archived_at IS NULL AND type != 'session' "
+            f"AND (title LIKE ? OR content LIKE ? OR summary LIKE ?){extra} LIMIT 10",
+            like_params
+        ).fetchall()
     if not rows:
         print("No results.")
         return
@@ -274,21 +308,23 @@ def cmd_stats(args):
     db = get_db()
     total    = db.execute("SELECT COUNT(*) FROM notes WHERE archived_at IS NULL").fetchone()[0]
     sessions = db.execute("SELECT COUNT(*) FROM notes WHERE type='session' AND archived_at IS NULL").fetchone()[0]
+    compacts = db.execute("SELECT COUNT(*) FROM notes WHERE type='compact' AND archived_at IS NULL").fetchone()[0]
     topics   = db.execute("SELECT COUNT(*) FROM notes WHERE type='topic'   AND archived_at IS NULL").fetchone()[0]
     archived = db.execute("SELECT COUNT(*) FROM notes WHERE archived_at IS NOT NULL").fetchone()[0]
     projects = db.execute("SELECT COUNT(DISTINCT project) FROM notes WHERE project IS NOT NULL AND archived_at IS NULL").fetchone()[0]
     size_kb  = DB_PATH.stat().st_size // 1024 if DB_PATH.exists() else 0
     cfg      = load_config()
     print(f"── engram stats ────────────────────")
-    print(f"  Machine:          {cfg.get('machine', os.uname().nodename)}")
-    print(f"  Notes (active):   {total - sessions - topics}")
-    print(f"  Session logs:     {sessions}")
-    print(f"  Topic hubs:       {topics}")
-    print(f"  Archived:         {archived}")
-    print(f"  Projects tracked: {projects}")
-    print(f"  DB size:          {size_kb} KB")
-    print(f"  DB path:          {DB_PATH}")
-    print(f"  Sync remote:      {cfg.get('remote', 'not configured')}")
+    print(f"  Machine:           {cfg.get('machine', os.uname().nodename)}")
+    print(f"  Notes (active):    {total - sessions - compacts - topics}")
+    print(f"  Session logs:      {sessions}")
+    print(f"  Compact summaries: {compacts}")
+    print(f"  Topic hubs:        {topics}")
+    print(f"  Archived:          {archived}")
+    print(f"  Projects tracked:  {projects}")
+    print(f"  DB size:           {size_kb} KB")
+    print(f"  DB path:           {DB_PATH}")
+    print(f"  Sync remote:       {cfg.get('remote', 'not configured')}")
 
 def cmd_update(args):
     db = get_db()
@@ -305,9 +341,16 @@ def cmd_update(args):
 
 def cmd_archive(args):
     db = get_db()
-    db.execute("UPDATE notes SET archived_at=datetime('now') WHERE id=?", [args.id])
+    # Fix 9: check rowcount to detect missing/already-archived notes
+    cursor = db.execute(
+        "UPDATE notes SET archived_at=datetime('now') WHERE id=? AND archived_at IS NULL",
+        [args.id]
+    )
     db.commit()
-    print(f"✓ Note {args.id} archived.")
+    if cursor.rowcount:
+        print(f"✓ Note {args.id} archived.")
+    else:
+        print(f"Note {args.id} not found or already archived.")
 
 def cmd_export(args):
     db = get_db()
@@ -319,15 +362,15 @@ def cmd_import(args):
     with open(args.file) as f:
         data = json.load(f)
     db = get_db()
-    count = 0
+    inserted = skipped = 0
     for r in data:
-        r.pop('id', None)
-        cols = ', '.join(r.keys())
-        placeholders = ', '.join(['?'] * len(r))
-        db.execute(f"INSERT INTO notes ({cols}) VALUES ({placeholders})", list(r.values()))
-        count += 1
+        cursor = safe_insert(db, r)  # Fix 3: whitelist; Fix 6: OR IGNORE
+        if cursor and cursor.rowcount:
+            inserted += 1
+        else:
+            skipped += 1
     db.commit()
-    print(f"✓ Imported {count} notes.")
+    print(f"✓ Imported {inserted} notes ({skipped} duplicates skipped).")
 
 def cmd_ingest(args):
     print(f"""
@@ -365,7 +408,8 @@ def cmd_session_start(args):
     print(f"  Project: {session['project']}  |  Machine: {machine_name()}")
     db = get_db()
     recent = db.execute(
-        "SELECT id, title, summary, created_at, machine FROM notes WHERE type='session' AND archived_at IS NULL ORDER BY id DESC LIMIT 5"
+        "SELECT id, title, summary, created_at, machine FROM notes "
+        "WHERE type IN ('session', 'compact') AND archived_at IS NULL ORDER BY id DESC LIMIT 5"
     ).fetchall()
     if recent:
         print("\n── Recent sessions (memory context) ────────────────────")
@@ -441,8 +485,10 @@ Duration: {duration_m:.0f}min
 def cmd_session_recent(args):
     db = get_db()
     limit = getattr(args, 'limit', 10)
+    # Fix 8: include 'compact' type so compaction summaries appear here
     rows = db.execute(
-        "SELECT id, project, title, summary, created_at, machine FROM notes WHERE type='session' AND archived_at IS NULL ORDER BY id DESC LIMIT ?",
+        "SELECT id, project, title, summary, created_at, machine FROM notes "
+        "WHERE type IN ('session', 'compact') AND archived_at IS NULL ORDER BY id DESC LIMIT ?",
         [limit]
     ).fetchall()
     if not rows:
@@ -550,27 +596,30 @@ def cmd_pull(args):
     db = get_db()
     ensure_uuids(db)
 
-    local_uuids = {
-        r[0] for r in db.execute("SELECT uuid FROM notes WHERE uuid IS NOT NULL").fetchall()
-    }
-
-    new_count = 0
+    # Fix 7: upsert by updated_at (not insert-only)
+    new_count = updated_count = 0
     for r in remote_data:
         uid = r.get("uuid")
-        if not uid or uid in local_uuids:
+        if not uid:
             continue
-        r.pop("id", None)
-        cols = ", ".join(r.keys())
-        placeholders = ", ".join(["?"] * len(r))
-        try:
-            db.execute(f"INSERT INTO notes ({cols}) VALUES ({placeholders})", list(r.values()))
+        local = db.execute("SELECT id, updated_at FROM notes WHERE uuid=?", [uid]).fetchone()
+        if not local:
+            safe_insert(db, r)  # Fix 3: whitelist columns
             new_count += 1
-        except sqlite3.IntegrityError:
-            pass
+        else:
+            remote_updated = r.get("updated_at", "")
+            if remote_updated > (local["updated_at"] or ""):
+                db.execute(
+                    "UPDATE notes SET title=?, content=?, summary=?, tags=?, "
+                    "archived_at=?, updated_at=? WHERE uuid=?",
+                    [r.get("title"), r.get("content"), r.get("summary"),
+                     r.get("tags"), r.get("archived_at"), remote_updated, uid]
+                )
+                updated_count += 1
     db.commit()
 
-    if new_count:
-        print(f"  ✓ Merged {new_count} new notes from remote.")
+    if new_count or updated_count:
+        print(f"  ✓ {new_count} new notes, {updated_count} updated from remote.")
     else:
         print(f"  Already up to date. ({len(remote_data)} notes in remote)")
 
@@ -582,10 +631,21 @@ def cmd_sync(args):
 # ─── HELPERS ──────────────────────────────────────────────────────────────────
 
 def resolve_project(args):
+    # Fix 11: use git root name to avoid same-name dir collisions
     if hasattr(args, 'project'):
-        if args.project == '.':
-            return Path(os.getcwd()).name
-        return args.project
+        p = args.project
+        if p and p != '.':
+            return p
+        try:
+            result = subprocess.run(
+                ['git', 'rev-parse', '--show-toplevel'],
+                capture_output=True, text=True, cwd=os.getcwd()
+            )
+            if result.returncode == 0:
+                return Path(result.stdout.strip()).name
+        except Exception:
+            pass
+        return Path(os.getcwd()).name
     return None
 
 # ─── CLI PARSER ───────────────────────────────────────────────────────────────
