@@ -20,3 +20,6 @@ config.json
 .session_context.txt
 .compaction_reminder.txt
 sync/
+
+# evaluations
+evals/
