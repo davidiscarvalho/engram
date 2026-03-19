@@ -84,3 +84,72 @@ For sync: a GitHub account with SSH key configured.
 
 - **[INSTALL.md](./INSTALL.md)** — install, SSH key setup, sync configuration, troubleshooting
 - **[USAGE.md](./USAGE.md)** — mental model, all commands, daily workflows
+
+---
+
+## Future development
+
+### MCP server
+
+The current architecture uses a `UserPromptSubmit` hook to push memory context into Claude on every prompt, plus shell commands (`engram search "..."`) for interactive queries. This works well but has one limitation: Claude has to run a subprocess to query memory, and the CLAUDE.md protocol has to remind it to do so.
+
+A native MCP server would expose engram as a set of Claude tools (`engram:search`, `engram:add`, `engram:get`, `engram:session_recent`). Claude would call them directly as tool use — no subprocess, no shell parsing, no reminder needed in CLAUDE.md.
+
+**The right architecture is both, not either/or:**
+
+- **Hook stays** for guaranteed upfront context injection — recent sessions and project notes appear before every response whether Claude thinks to ask or not.
+- **MCP server adds** interactive pull querying — Claude can chain multiple searches, follow up with `get`, and call `add` mid-task without constructing shell commands.
+
+**Implementation sketch:**
+
+```python
+# engram_mcp.py — ~100 lines using the mcp Python SDK
+from mcp.server.fastmcp import FastMCP
+mcp = FastMCP("engram")
+
+@mcp.tool()
+def search(query: str, project: str = None) -> str:
+    """Search engram memory. Returns matching notes with summaries."""
+    ...
+
+@mcp.tool()
+def add(title: str, tags: str, body: str, project: str = None) -> str:
+    """Save a note to engram memory."""
+    ...
+
+@mcp.tool()
+def get(id: int) -> str:
+    """Fetch full content of a note by ID."""
+    ...
+
+@mcp.tool()
+def session_recent() -> str:
+    """Show recent session logs and compact summaries."""
+    ...
+```
+
+Registered in `~/.claude/settings.json`:
+```json
+{
+  "mcpServers": {
+    "engram": {
+      "command": "python3",
+      "args": ["~/.claude/engram/engram_mcp.py"]
+    }
+  }
+}
+```
+
+**Key trade-off:** the MCP server and CLI would share the same SQLite logic. The clean implementation extracts core DB functions into a shared module (`engram_core.py`) imported by both — otherwise any new command needs to be added in two places.
+
+**When this makes sense:** the current hook + CLI approach already works correctly. MCP becomes worthwhile if engram grows to support richer multi-step memory workflows, or if the CLI shelling friction becomes noticeable in practice.
+
+### Project identity via git remote
+
+Currently `-p .` resolves to the git repository root folder name (e.g. `engram`). This can collide when two unrelated repos share the same folder name (`~/client-a/api` and `~/client-b/api` both become `api`).
+
+The correct fix is to use the normalized git remote URL as the project identifier (`owner/repo`), which is stable across machines and unique across repos. This requires a one-time data migration to rewrite existing `project` field values — deferred until a migration command is implemented.
+
+### Schema versioning
+
+The current `get_db()` uses ad-hoc `ALTER TABLE` checks for each column. A `meta(key, value)` table tracking `schema_version` would make future migrations explicit and sequential rather than scattered inline checks.
