@@ -35,10 +35,12 @@ cp "$SCRIPT_DIR/hooks/session_start.py" "$HOOKS_DIR/engram_session_start.py"
 cp "$SCRIPT_DIR/hooks/session_end.py"   "$HOOKS_DIR/engram_session_end.py"
 cp "$SCRIPT_DIR/hooks/pre_compact.py"   "$HOOKS_DIR/engram_pre_compact.py"
 cp "$SCRIPT_DIR/hooks/post_compact.py"  "$HOOKS_DIR/engram_post_compact.py"
+cp "$SCRIPT_DIR/hooks/auto_note.py"     "$HOOKS_DIR/engram_auto_note.py"
 chmod +x "$HOOKS_DIR/engram_session_start.py"
 chmod +x "$HOOKS_DIR/engram_session_end.py"
 chmod +x "$HOOKS_DIR/engram_pre_compact.py"
 chmod +x "$HOOKS_DIR/engram_post_compact.py"
+chmod +x "$HOOKS_DIR/engram_auto_note.py"
 
 SETTINGS_FILE="$CLAUDE_DIR/settings.json"
 if [ ! -f "$SETTINGS_FILE" ]; then
@@ -100,6 +102,17 @@ existing_post_compact = [h.get("hooks", [{}])[0].get("command", "") for h in hoo
 if not any("engram_post_compact" in c for c in existing_post_compact):
     hooks["PostCompact"].append(post_compact_hook)
 
+hooks.setdefault("PostToolUse", [])
+auto_note_hook = {
+    "hooks": [{
+        "type": "command",
+        "command": f"python3 {hooks_dir}/engram_auto_note.py"
+    }]
+}
+existing_auto = [h.get("hooks", [{}])[0].get("command", "") for h in hooks["PostToolUse"]]
+if not any("engram_auto_note" in c for c in existing_auto):
+    hooks["PostToolUse"].append(auto_note_hook)
+
 with open(settings_path, "w") as f:
     json.dump(settings, f, indent=2)
 
@@ -158,6 +171,7 @@ assert any('engram_session_start' in str(x) for x in h.get('UserPromptSubmit', [
 assert any('engram_pre_compact'   in str(x) for x in h.get('PreCompact', []))
 assert any('engram_session_end'   in str(x) for x in h.get('SessionEnd', []))
 assert any('engram_post_compact'  in str(x) for x in h.get('PostCompact', []))
+assert any('engram_auto_note'     in str(x) for x in h.get('PostToolUse', []))
 print('  ✓ Hooks registered in settings.json')
 " 2>/dev/null || echo "  ✗ Hook registration failed"
 
