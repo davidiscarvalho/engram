@@ -86,7 +86,9 @@ def main():
 
         recent = conn.execute(
             "SELECT id, project, title, summary FROM notes "
-            "WHERE type IN ('session', 'compact') AND archived_at IS NULL "
+            "WHERE (type IN ('session', 'compact') "
+            "       OR (type='note' AND tags LIKE '%session%')) "
+            "AND archived_at IS NULL "
             "ORDER BY id DESC LIMIT 3"
         ).fetchall()
 
@@ -101,6 +103,7 @@ def main():
         proj_notes = conn.execute(
             "SELECT id, title, tags FROM notes "
             "WHERE project=? AND type='note' AND archived_at IS NULL "
+            "AND tags NOT LIKE '%auto%' "
             "ORDER BY updated_at DESC LIMIT 5",
             [cwd_project]
         ).fetchall()

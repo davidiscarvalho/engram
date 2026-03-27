@@ -36,6 +36,14 @@ def main():
             log("Session end triggered successfully")
         except Exception as e:
             log(f"Error ending session: {e}")
+
+    if ENGRAM_CLI.exists():
+        try:
+            subprocess.run(["python3", str(ENGRAM_CLI), "sync"],
+                           capture_output=True, timeout=15)
+            log("Sync triggered on session end")
+        except Exception as e:
+            log(f"Sync error: {e}")
     sys.exit(0)
 
 

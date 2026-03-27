@@ -799,7 +799,7 @@ def resolve_project(args):
     if hasattr(args, 'project'):
         p = args.project
         if p and p != '.':
-            return p
+            return Path(p).name if Path(p).is_absolute() else p
         try:
             result = subprocess.run(
                 ['git', 'rev-parse', '--show-toplevel'],
